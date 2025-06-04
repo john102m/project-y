@@ -1,54 +1,45 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# **Project-Y: ESP32-C3 BLE Development**
+🚀 **Project-Y** is a firmware project focused on **Bluetooth Low Energy (BLE) development** using the **ESP32-C3** microcontroller and ESP-IDF with FreeRTOS. This repository covers **setup, BLE implementation, and debugging**.
 
-# Hello World Example
+## **Why ESP32-C3?**
+✅ **Low-power BLE 5.0** for efficient IoT communication  
+✅ **RISC-V architecture** for improved performance  
+✅ **Built-in USB support** for flashing without extra adapters  
+✅ **FreeRTOS integration** for advanced task management  
 
-Starts a FreeRTOS task to print "Hello World".
-
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
-
-## How to use example
-
-Follow detailed instructions provided specifically for this example.
-
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+## **Project Structure**
+📁 main/ # Core firmware (BLE communication logic) 📁 .vscode/ # VS Code settings & workspace config 📁 sdkconfig # ESP-IDF BLE configuration file 📁 pytest_hello_world.py # Initial Python testing script 📁 .gitignore # Ignores compiled files (build/)
 
 
-## Example folder contents
+## **Setup Instructions**
+### **1️⃣ Install ESP-IDF**
+Follow Espressif’s guide:  
+🔗 [ESP-IDF Setup Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/get-started/index.html)
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
+### **2️⃣ Clone This Repository**
+```sh
+git clone https://github.com/your-username/project-y.git
+cd project-y
+3️⃣ Set ESP32-C3 as Target & Configure
+sh
+idf.py set-target esp32c3
+idf.py menuconfig  # Modify BLE settings if needed
+4️⃣ Build & Flash Firmware
+sh
+idf.py build
+idf.py flash
+idf.py monitor  # Debug output
+BLE Functionality
+✅ Device Advertising – BLE peripheral broadcasts data for discovery ✅ BLE Connections – Supports mobile apps like nRF Connect & LightBlue ✅ Data Exchange – Custom characteristics for sensor data transmission
 
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
+Development Tools
+ESP-IDF → Official development framework
 
-Below is short explanation of remaining files in the project folder.
+VS Code + ESP-IDF Extension → Code editor & build tools
 
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
-```
+nRF Connect / LightBlue → BLE debugging tools
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+GitHub → Version control & collaboration
 
-## Troubleshooting
-
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
-"# project-y" 
+Contributing
+🚀 Want to contribute? Feel free to submit PRs, suggest improvements, or report issues!
