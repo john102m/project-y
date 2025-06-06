@@ -8,7 +8,11 @@
 ✅ **FreeRTOS integration** for advanced task management  
 
 ## **Project Structure**
-📁 main/ # Core firmware (BLE communication logic) 📁 .vscode/ # VS Code settings & workspace config 📁 sdkconfig # ESP-IDF BLE configuration file 📁 pytest_hello_world.py # Initial Python testing script 📁 .gitignore # Ignores compiled files (build/)
+📁 main/ # Core firmware (BLE communication logic) 
+📁 .vscode/ # VS Code settings & workspace config 
+📁 sdkconfig # ESP-IDF BLE configuration file 
+📁 pytest_hello_world.py # Initial Python testing script 
+📁 .gitignore # Ignores compiled files (build/)
 
 
 ## **Setup Instructions**
@@ -18,7 +22,7 @@ Follow Espressif’s guide:
 
 ### **2️⃣ Clone This Repository**
 ```sh
-git clone https://github.com/your-username/project-y.git
+git clone https://github.com/john102m/project-y.git
 cd project-y
 3️⃣ Set ESP32-C3 as Target & Configure
 sh
@@ -30,7 +34,9 @@ idf.py build
 idf.py flash
 idf.py monitor  # Debug output
 BLE Functionality
-✅ Device Advertising – BLE peripheral broadcasts data for discovery ✅ BLE Connections – Supports mobile apps like nRF Connect & LightBlue ✅ Data Exchange – Custom characteristics for sensor data transmission
+✅ Device Advertising – BLE peripheral broadcasts data for discovery
+✅ BLE Connections – Supports mobile apps like nRF Connect & LightBlue
+✅ Data Exchange – Custom characteristics for sensor data transmission
 
 Development Tools
 ESP-IDF → Official development framework
