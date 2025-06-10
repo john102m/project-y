@@ -26,12 +26,19 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gatt_common_api.h"
 #include "driver/gpio.h"
+#include "esp_intr_alloc.h"
+
+#include "esp_adc/adc_oneshot.h"
 
 static const char *TAG = "ESP32C3";
 #define BLE_TAG "BLE"
 #define LED_GPIO 8                // Onboard LED pin
+#define STAT_PIN GPIO_NUM_1       // GPIO1
 #define NOTIFY_DEBOUNCE_US 500000 // 500ms
-QueueHandle_t delay_queue;
+#define INTR_DEBOUNCE_DELAY_MS 500
+
+volatile uint32_t last_interrupt_time = 0;
+QueueHandle_t delay_queue, gpio_evt_queue = NULL;
 
 // home made struct for connection info - can be used in notifications
 typedef struct
@@ -76,29 +83,29 @@ esp_bt_uuid_t service_uuid = {
 
 // BLE Advertising Data
 static esp_ble_adv_data_t adv_data = {
-    .set_scan_rsp = false, //Determines whether scan response data is included (disabled here).
-    .include_name = true,//Advertises the device name.
-    .include_txpower = true,//Advertises the transmission power, helping remote devices estimate distance.
-    .min_interval = 0x0006, //Minimum connection interval, determining how often devices exchange data (in BLE time units).
-    .max_interval = 0x0010, // Maximum connection interval, balancing latency vs. power consumption.
-    .appearance = 0x00, //Defines the device category (0x00 = unspecified/custom).
-    .manufacturer_len = 0, // No manufacturer-specific data included.
-    .p_manufacturer_data = NULL, //No custom manufacturer data provided.
-    .service_data_len = 0, //No additional service data included.
-    .p_service_data = NULL,//No service-specific data provided.
-    .service_uuid_len = ESP_UUID_LEN_128,//Specifies that the advertised service UUID is 128-bit.
-    .p_service_uuid = service_uuid.uuid.uuid128, //Pointer to the service UUID being advertised.
-    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT), //Flags indicate that the device is generally discoverable and does not support classic Bluetooth (BR/EDR).
+    .set_scan_rsp = false,                                                // Determines whether scan response data is included (disabled here).
+    .include_name = true,                                                 // Advertises the device name.
+    .include_txpower = true,                                              // Advertises the transmission power, helping remote devices estimate distance.
+    .min_interval = 0x0006,                                               // Minimum connection interval, determining how often devices exchange data (in BLE time units).
+    .max_interval = 0x0010,                                               // Maximum connection interval, balancing latency vs. power consumption.
+    .appearance = 0x00,                                                   // Defines the device category (0x00 = unspecified/custom).
+    .manufacturer_len = 0,                                                // No manufacturer-specific data included.
+    .p_manufacturer_data = NULL,                                          // No custom manufacturer data provided.
+    .service_data_len = 0,                                                // No additional service data included.
+    .p_service_data = NULL,                                               // No service-specific data provided.
+    .service_uuid_len = ESP_UUID_LEN_128,                                 // Specifies that the advertised service UUID is 128-bit.
+    .p_service_uuid = service_uuid.uuid.uuid128,                          // Pointer to the service UUID being advertised.
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT), // Flags indicate that the device is generally discoverable and does not support classic Bluetooth (BR/EDR).
 };
 
 // BLE Advertising Config
 static esp_ble_adv_params_t adv_params = {
-    .adv_int_min = 0x20,//Minimum advertising interval (32 * 0.625ms = 20ms).
-    .adv_int_max = 0x40,//Maximum advertising interval (64 * 0.625ms = 40ms).
-    .adv_type = ADV_TYPE_IND,//Uses connectable undirected advertising, allowing any device to connect.
-    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,//Advertises using the public Bluetooth address.
-    .channel_map = ADV_CHNL_ALL,//Uses all three advertising channels for maximum visibility.
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,//Allows any device to scan or connect, without filtering.
+    .adv_int_min = 0x20,                                    // Minimum advertising interval (32 * 0.625ms = 20ms).
+    .adv_int_max = 0x40,                                    // Maximum advertising interval (64 * 0.625ms = 40ms).
+    .adv_type = ADV_TYPE_IND,                               // Uses connectable undirected advertising, allowing any device to connect.
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,                  // Advertises using the public Bluetooth address.
+    .channel_map = ADV_CHNL_ALL,                            // Uses all three advertising channels for maximum visibility.
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY, // Allows any device to scan or connect, without filtering.
 };
 
 // Function to send notification or indication
@@ -273,11 +280,51 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     }
 }
 
+void IRAM_ATTR gpio_isr_handler(void *arg)
+{
+    int gpio_num = (int)arg;                    // Get GPIO number from arg
+    uint32_t now = esp_timer_get_time() / 1000; // Convert to milliseconds
+    if (now - last_interrupt_time > INTR_DEBOUNCE_DELAY_MS)
+    {
+        last_interrupt_time = now;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(gpio_evt_queue, &gpio_num, &xHigherPriorityTaskWoken);
+    }
+}
+void gpio_event_task(void *arg)
+{
+    int gpio_num;
+    for (;;)
+    {
+        if (xQueueReceive(gpio_evt_queue, &gpio_num, portMAX_DELAY))
+        {
+            int level = gpio_get_level(gpio_num);
+            ESP_LOGI("GPIO", "Detected change on GPIO %d, new state: %d", gpio_num, level);
+            char info_str[32];
+            snprintf(info_str, sizeof(info_str), "Status: %s", level ? "Not Charging" : "Charging");
+            send_ble_notification_or_indication(&ble_connection, info_str, false);
+        }
+    }
+}
+
 void init_pins(void)
 {
+    gpio_evt_queue = xQueueCreate(1, sizeof(int)); // Example: Queue for 10 integers
+
+    // Configure STAT_PIN as input
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << STAT_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE};
+    gpio_config(&io_conf);
+    // gpio_install_isr_service(0);
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(STAT_PIN, gpio_isr_handler, (void *)STAT_PIN));
+
     // Initialize LED GPIO
     gpio_reset_pin(LED_GPIO);
-    // gpio_set_pull_mode(LED_GPIO, GPIO_PULLDOWN_ONLY);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
 }
 
@@ -359,10 +406,52 @@ void ble_rssi_notify_task(void *pvParameter)
         }
     }
 }
+float calibrate_adc(int raw_adc)
+{
+    float Vmax = 3.3;  // FSD voltage due to ADC_ATTEN_DB_12
+    float Dmax = 4095; // Max ADC raw value (12-bit resolution)
+
+    return (raw_adc / Dmax) * Vmax; // Corrected voltage output
+}
+
+void read_battery_voltage_task()
+{
+
+    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&init_cfg, &adc_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &chan_cfg);
+
+    for (;;)
+    {
+        int raw_value;
+        adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &raw_value);
+
+        ESP_LOGI(TAG, "ADC Raw: %d", raw_value);
+
+        float voltage = calibrate_adc(raw_value);
+        ESP_LOGI(TAG, "Voltage: %.2fV", voltage);
+        if (ble_connected)
+        {
+            char volt_str[20]; // Increased buffer size to accommodate the status text
+            snprintf(volt_str, sizeof(volt_str), "Voltage: %.2fV", voltage);
+            send_ble_notification_or_indication(&ble_connection, volt_str, false);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 void blink_task(void *pvParameter)
 {
     uint32_t count = 0, current_delay = *(uint32_t *)pvParameter;
-    ;
+
     for (;;)
     {
         gpio_set_level(LED_GPIO, count++ % 2);
@@ -394,8 +483,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Limited Information:\n");
     ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
     get_mac_address();
-    xTaskCreate(blink_task, "BlinkTask", 2048, (void *)&(uint32_t){1000}, 1, NULL);
+    xTaskCreate(blink_task, "Blink Task", 2048, (void *)&(uint32_t){1000}, 1, NULL);
     xTaskCreate(ble_rssi_notify_task, "RSSI Notify Task", 2048, NULL, 5, NULL);
+    xTaskCreate(read_battery_voltage_task, "Battery Voltage  Task", 2048, NULL, 5, NULL);
+    xTaskCreate(gpio_event_task, "GPIO Event Task", 2048, NULL, 5, NULL);
 
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, 20); // -12 dBm
     esp_power_level_t power = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV);
