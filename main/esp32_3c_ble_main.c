@@ -31,11 +31,14 @@
 #include "esp_adc/adc_oneshot.h"
 
 static const char *TAG = "ESP32C3";
+#define RESET_TAG "RESET"
 #define BLE_TAG "BLE"
 #define LED_GPIO 8                // Onboard LED pin
 #define STAT_PIN GPIO_NUM_1       // GPIO1
 #define NOTIFY_DEBOUNCE_US 500000 // 500ms
 #define INTR_DEBOUNCE_DELAY_MS 500
+TaskHandle_t blink_task_handle = NULL; // Global variable
+static adc_oneshot_unit_handle_t adc_handle;
 
 volatile uint32_t last_interrupt_time = 0;
 QueueHandle_t delay_queue, gpio_evt_queue = NULL;
@@ -48,7 +51,7 @@ typedef struct
     // BLE Service & Characteristic Handles
     uint16_t service_handle;
     uint16_t char_handle;
-
+    uint16_t cccd_handle;
     int64_t last_sent_time_us; // For timing-based debounce
     esp_bd_addr_t remote_bda;
 
@@ -58,6 +61,9 @@ typedef struct
 // Global variable to store the characteristic handle (and other stuff related to the connection)
 static ble_connection_t ble_connection = {0}; // Zero-initialized global
 static bool ble_connected = false;
+char notifMessage[32];
+float vBattery = 0;
+float vLightSense = 0;
 
 // UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b
 static const uint8_t SERVICE_UUID[ESP_UUID_LEN_128] = {
@@ -122,11 +128,10 @@ void send_ble_notification_or_indication(ble_connection_t *conn_info, const char
     conn_info->last_sent_time_us = now;
 
     uint16_t length = strlen(message); // No +1 to avoid sending null terminator unless needed
-    uint8_t *notify_value = malloc(length);
-    if (!notify_value)
+    uint8_t notify_value[32];          // use fixed buffer to avoid malloc
+    if (length >= sizeof(notify_value))
     {
-        ESP_LOGE(BLE_TAG, "Failed to allocate memory for notification");
-        return;
+        length = sizeof(notify_value) - 1;
     }
 
     memcpy(notify_value, message, length);
@@ -139,16 +144,9 @@ void send_ble_notification_or_indication(ble_connection_t *conn_info, const char
         notify_value,
         is_indication);
 
-    free(notify_value);
-
     if (err != ESP_OK)
     {
         ESP_LOGE(BLE_TAG, "Notification send failed: %s", esp_err_to_name(err));
-    }
-    else
-    {
-        ESP_LOGI(BLE_TAG, "Sent BLE message (%d bytes) as %s: %s",
-                 length, is_indication ? "Indication" : "Notification", message);
     }
 }
 
@@ -188,7 +186,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             .uuid = {.uuid128 = {0}}};
         memcpy(char_uuid.uuid.uuid128, CHARACTERISTIC_UUID, ESP_UUID_LEN_128);
 
-        esp_gatt_char_prop_t char_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE;
+        // esp_gatt_char_prop_t char_property = ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+        esp_gatt_char_prop_t char_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 
         ESP_LOGI(BLE_TAG, "Adding characteristic with UUID: %02x%02x...", CHARACTERISTIC_UUID[0], CHARACTERISTIC_UUID[1]);
 
@@ -207,10 +206,33 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_ADD_CHAR_EVT:
         ESP_LOGI(BLE_TAG, "Characteristic added, handle=%d", param->add_char.attr_handle);
         ble_connection.char_handle = param->add_char.attr_handle;
-        // Start service
+        // Add CCCD descriptor for notifications/indications
+        //     esp_bt_uuid_t cccd_uuid = {
+        //         .len = ESP_UUID_LEN_16,
+        //         .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG}};
+
+        //     esp_err_t err = esp_ble_gatts_add_char_descr(
+        //         ble_connection.char_handle,
+        //         &cccd_uuid,
+        //         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+        //         NULL, NULL);
+
+        //     if (err != ESP_OK)
+        //     {
+        //         ESP_LOGE(BLE_TAG, "Failed to add CCCD descriptor: %d", err);
+        //     }
+
+        // //     // Start service
+        //      //esp_ble_gatts_start_service(ble_connection.service_handle);
+        //      break;
+        // case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        //      ble_connection.cccd_handle = param->add_char_descr.attr_handle;
+        //      ESP_LOGI(BLE_TAG, "CCCD handle saved: %d", ble_connection.cccd_handle);
+        //      ESP_LOGI(BLE_TAG, "Descriptor added, handle=%d", param->add_char_descr.attr_handle);
+
+        // After descriptor added, start the service
         esp_ble_gatts_start_service(ble_connection.service_handle);
         break;
-
     case ESP_GATTS_CONNECT_EVT:
         ESP_LOGI(BLE_TAG, "Device connected! conn_id=%d", param->connect.conn_id);
 
@@ -233,6 +255,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         // control the blink rate of the blink task
         xQueueSend(delay_queue, &(uint32_t){100}, portMAX_DELAY);
         ESP_LOGI(BLE_TAG, "Device disconnected, restarting advertising...");
+        vTaskResume(blink_task_handle);             // Pauses the task
         esp_ble_gap_start_advertising(&adv_params); // Restart advertising
 
         break;
@@ -251,6 +274,26 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
     case ESP_GATTS_WRITE_EVT:
         ESP_LOGI(BLE_TAG, "Write request received: %.*s", param->write.len, param->write.value);
+        // if (param->write.handle == ble_connection.cccd_handle && param->write.len == 2)
+        // {
+        //     ESP_LOGI(BLE_TAG, "Client wrote to CCCD: 0x%02x%02x", param->write.value[1], param->write.value[0]);
+        // }
+
+        // Check if the received command is "LED_OFF" or "LED_ON" (case-sensitive)
+        if (param->write.len >= 6 && blink_task_handle != NULL)
+        {
+            if (memcmp(param->write.value, "LED_OFF", 7) == 0)
+            {
+                vTaskSuspend(blink_task_handle); // Pauses the task
+                gpio_set_level(LED_GPIO, 1);     // Ensure LED is off
+                ESP_LOGI(BLE_TAG, "Blink task SUSPENDED");
+            }
+            else if (memcmp(param->write.value, "LED_ON", 6) == 0)
+            {
+                vTaskResume(blink_task_handle); // Pauses the task
+                ESP_LOGI(BLE_TAG, "Blink task RESUMED");
+            }
+        }
 
         // Validate handle before sending response
         if (param->write.handle == ble_connection.char_handle)
@@ -272,7 +315,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         }
         break;
     case ESP_GATTS_CONF_EVT:
-        ESP_LOGI(BLE_TAG, "Indication confirmed, status = %d", param->conf.status);
+        // ESP_LOGI(BLE_TAG, "Indication confirmed, status = %d", param->conf.status);
         break;
     default:
         ESP_LOGI(BLE_TAG, "Unhandled GATT event: %d", event);
@@ -291,8 +334,10 @@ void IRAM_ATTR gpio_isr_handler(void *arg)
         xQueueSendFromISR(gpio_evt_queue, &gpio_num, &xHigherPriorityTaskWoken);
     }
 }
+
 void gpio_event_task(void *arg)
 {
+    char info_str[32];
     int gpio_num;
     for (;;)
     {
@@ -300,9 +345,11 @@ void gpio_event_task(void *arg)
         {
             int level = gpio_get_level(gpio_num);
             ESP_LOGI("GPIO", "Detected change on GPIO %d, new state: %d", gpio_num, level);
-            char info_str[32];
-            snprintf(info_str, sizeof(info_str), "Status: %s", level ? "Not Charging" : "Charging");
-            send_ble_notification_or_indication(&ble_connection, info_str, false);
+            if (ble_connected)
+            {
+                snprintf(info_str, sizeof(info_str), "Status: %s", level ? "Not Charging" : "Charging");
+                send_ble_notification_or_indication(&ble_connection, info_str, false);
+            }
         }
     }
 }
@@ -317,8 +364,11 @@ void init_pins(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE};
-    gpio_config(&io_conf);
+        .intr_type = GPIO_INTR_POSEDGE};
+    // I'm just doing this to appreciate the syntax
+    gpio_config_t *gpio_config_ptr = &io_conf;
+    gpio_config(gpio_config_ptr);
+
     // gpio_install_isr_service(0);
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(STAT_PIN, gpio_isr_handler, (void *)STAT_PIN));
@@ -339,11 +389,16 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     case ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT:
         if (param->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS)
         {
-            char rssi_str[16];
-            snprintf(rssi_str, sizeof(rssi_str), "RSSI:%d", param->read_rssi_cmpl.rssi);
+            //snprintf(notifMessage, sizeof(notifMessage), "V%.2fR%d", vBattery, param->read_rssi_cmpl.rssi);
+            snprintf(
+                notifMessage,
+                sizeof(notifMessage),
+                "V%.2fL%.0fR%d",
+                vBattery,
+                vLightSense * 100.0f,
+                param->read_rssi_cmpl.rssi); //e.g. "V3.76L81R-64"
 
-            // Send to the phone app
-            send_ble_notification_or_indication(&ble_connection, rssi_str, false);
+            send_ble_notification_or_indication(&ble_connection, notifMessage, false);
         }
         break;
     default:
@@ -382,6 +437,7 @@ void ble_init()
         ESP_LOGE(BLE_TAG, "Failed to configure adv data: %s", esp_err_to_name(ret));
     }
 }
+
 void get_mac_address()
 {
     const uint8_t *mac = esp_bt_dev_get_address();
@@ -397,7 +453,7 @@ void ble_rssi_notify_task(void *pvParameter)
 
         if (ble_connected)
         {
-            // int rssi;
+
             //  Get RSSI — connection handle = remote_bda
             esp_ble_gap_read_rssi(ble_connection.remote_bda); // You'll need to save this too!
 
@@ -417,37 +473,43 @@ float calibrate_adc(int raw_adc)
 void read_battery_voltage_task()
 {
 
-    adc_oneshot_unit_handle_t adc_handle;
-    adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = ADC_UNIT_1,
-    };
-    adc_oneshot_new_unit(&init_cfg, &adc_handle);
-
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &chan_cfg);
-
     for (;;)
     {
+        ESP_LOGI(TAG, "Stack watermark: %u", uxTaskGetStackHighWaterMark(NULL));
         int raw_value;
         adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &raw_value);
 
         ESP_LOGI(TAG, "ADC Raw: %d", raw_value);
 
-        float voltage = calibrate_adc(raw_value);
-        ESP_LOGI(TAG, "Voltage: %.2fV", voltage);
-        if (ble_connected)
-        {
-            char volt_str[20]; // Increased buffer size to accommodate the status text
-            snprintf(volt_str, sizeof(volt_str), "Voltage: %.2fV", voltage);
-            send_ble_notification_or_indication(&ble_connection, volt_str, false);
-        }
+        vBattery = calibrate_adc(raw_value);
+        ESP_LOGI(TAG, "%.2fv", vBattery);
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(5000)); // update the battery level every 5 seconds
     }
 }
+void read_ldr_light_task(void *pvParameters)
+{
+
+    for (;;)
+    {
+        int sum = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            int r = 0;
+            adc_oneshot_read(adc_handle, ADC_CHANNEL_2, &r);
+            sum += r;
+        }
+        float avg = sum / 8.0;
+
+        // Optionally normalize it to 0.0–1.0
+        vLightSense = avg / 4095.0f;
+
+        ESP_LOGI("LDR", "Raw: %.2f | Brightness: %.2f%%", avg, vLightSense * 100);
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Update every 2s
+    }
+}
+
 void blink_task(void *pvParameter)
 {
     uint32_t count = 0, current_delay = *(uint32_t *)pvParameter;
@@ -464,8 +526,74 @@ void blink_task(void *pvParameter)
     }
 }
 
+void init_adc_channels()
+{
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&init_cfg, &adc_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+
+    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &chan_cfg); // Battery
+    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_2, &chan_cfg); // LDR
+}
+
+void log_reset_reason(void)
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    const char *reason_str;
+
+    switch (reason)
+    {
+    case ESP_RST_UNKNOWN:
+        reason_str = "Unknown";
+        break;
+    case ESP_RST_POWERON:
+        reason_str = "Power-on reset";
+        break;
+    case ESP_RST_EXT:
+        reason_str = "External reset";
+        break;
+    case ESP_RST_SW:
+        reason_str = "Software reset";
+        break;
+    case ESP_RST_PANIC:
+        reason_str = "Exception/panic reset";
+        break;
+    case ESP_RST_INT_WDT:
+        reason_str = "Interrupt watchdog reset";
+        break;
+    case ESP_RST_TASK_WDT:
+        reason_str = "Task watchdog reset";
+        break;
+    case ESP_RST_WDT:
+        reason_str = "Other watchdog reset";
+        break;
+    case ESP_RST_DEEPSLEEP:
+        reason_str = "Deep sleep reset";
+        break;
+    case ESP_RST_BROWNOUT:
+        reason_str = "Brownout reset";
+        break;
+    case ESP_RST_SDIO:
+        reason_str = "SDIO reset";
+        break;
+    default:
+        reason_str = "Unknown reset reason";
+        break;
+    }
+
+    ESP_LOGW(RESET_TAG, "Reset reason: %d (%s)", reason, reason_str);
+}
+
 void app_main(void)
 {
+    log_reset_reason();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -476,6 +604,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     init_pins();
+    init_adc_channels();
     delay_queue = xQueueCreate(1, sizeof(uint32_t));
 
     ble_init();
@@ -483,10 +612,13 @@ void app_main(void)
     ESP_LOGI(TAG, "Limited Information:\n");
     ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
     get_mac_address();
-    xTaskCreate(blink_task, "Blink Task", 2048, (void *)&(uint32_t){1000}, 1, NULL);
+    xTaskCreate(blink_task, "Blink Task", 2048, (void *)&(uint32_t){1000}, 1, &blink_task_handle);
     xTaskCreate(ble_rssi_notify_task, "RSSI Notify Task", 2048, NULL, 5, NULL);
-    xTaskCreate(read_battery_voltage_task, "Battery Voltage  Task", 2048, NULL, 5, NULL);
+    // xTaskCreate(read_battery_voltage_task, "Battery Voltage  Task", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(read_battery_voltage_task, "Battery Voltage Task", 4096, NULL, 5, NULL, 0);
+
     xTaskCreate(gpio_event_task, "GPIO Event Task", 2048, NULL, 5, NULL);
+    xTaskCreate(read_ldr_light_task, "LDR ADC Read Task", 2048, NULL, 5, NULL);
 
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, 20); // -12 dBm
     esp_power_level_t power = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV);
