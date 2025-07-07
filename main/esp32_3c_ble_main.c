@@ -604,21 +604,6 @@ void read_ldr_light_task(void *pvParameters)
     }
 }
 
-void blink_task_old(void *pvParameter)
-{
-    uint32_t count = 0, current_delay = *(uint32_t *)pvParameter;
-
-    for (;;)
-    {
-        gpio_set_level(LED_GPIO, count++ % 2);
-        // Check if a new delay value is available
-        if (xQueueReceive(delay_queue, &current_delay, 0))
-        {
-            ESP_LOGI(TAG, "Updated delay: %ld ms\n", current_delay);
-        }
-        vTaskDelay(pdMS_TO_TICKS(current_delay));
-    }
-}
 void blink_task(void *pvParameter)
 {
     blink_pattern_t pattern = *(blink_pattern_t *)pvParameter;
