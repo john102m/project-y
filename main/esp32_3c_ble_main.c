@@ -35,8 +35,11 @@ static const char *TAG = "ESP32C3";
 #define BLE_TAG "BLE"
 #define LED_GPIO 8                // Onboard LED pin
 #define STAT_PIN GPIO_NUM_1       // GPIO1
-#define NOTIFY_DEBOUNCE_US 500000 // 500ms
+#define NOTIFY_DEBOUNCE_US 200000 // 200ms
 #define INTR_DEBOUNCE_DELAY_MS 500
+#define DEFAULT_LDR_TRIGGER_LEVEL 10
+#define INVALID_LDR_LEVEL -1
+
 TaskHandle_t blink_task_handle = NULL; // Global variable
 static adc_oneshot_unit_handle_t adc_handle;
 
@@ -57,13 +60,27 @@ typedef struct
 
     // Optional: char last_message[64]; // To compare last sent message
 } ble_connection_t;
+typedef struct
+{
+    uint32_t on_time;
+    uint32_t off_time;
+} blink_pattern_t;
+
+static const blink_pattern_t FAST_BLINK = {100, 100};
+static const blink_pattern_t SLOW_BLINK = {1000, 1000};
+static const blink_pattern_t PMODE_PATTERN = {200, 800};
 
 // Global variable to store the characteristic handle (and other stuff related to the connection)
 static ble_connection_t ble_connection = {0}; // Zero-initialized global
 static bool ble_connected = false;
+static bool p_mode = false;
 char notifMessage[32];
 float vBattery = 0;
 float vLightSense = 0;
+int rssi_read_intvl = 5000;         // 5 seconds default
+int ldr_trigger_lvl = 0;            // no trigger (default)
+int usr_tr_lvl = INVALID_LDR_LEVEL; // user trigger level unset
+int ldr_read_intvl = 2000;          // 2 seconds default
 
 // UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b
 static const uint8_t SERVICE_UUID[ESP_UUID_LEN_128] = {
@@ -147,6 +164,40 @@ void send_ble_notification_or_indication(ble_connection_t *conn_info, const char
     if (err != ESP_OK)
     {
         ESP_LOGE(BLE_TAG, "Notification send failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void sendChargingStatus()
+{
+    if (!ble_connected)
+        return;
+
+    int level = gpio_get_level(STAT_PIN);
+    ESP_LOGI("GPIO", "Level on GPIO %d : %s", STAT_PIN, level ? "HIGH" : "LOW");
+    char info_str[20];
+    snprintf(info_str, sizeof(info_str), level ? "Not Charging" : "Charging");
+    send_ble_notification_or_indication(&ble_connection, info_str, false);
+}
+static void set_pmode_on()
+{
+    ldr_read_intvl = 500;
+    // Use usr_tr_lvl if it's valid, otherwise default to 25
+    ldr_trigger_lvl = (usr_tr_lvl < 0) ? DEFAULT_LDR_TRIGGER_LEVEL : usr_tr_lvl;
+    p_mode = true;
+    xQueueSend(delay_queue, &PMODE_PATTERN, portMAX_DELAY);
+}
+static void set_pmode_off()
+{
+    ldr_read_intvl = 2000;
+    ldr_trigger_lvl = 0;
+    p_mode = false;
+    if (ble_connected)
+    {
+        xQueueSend(delay_queue, &SLOW_BLINK, portMAX_DELAY);
+    }
+    else
+    {
+        xQueueSend(delay_queue, &FAST_BLINK, portMAX_DELAY);
     }
 }
 
@@ -243,17 +294,20 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
         ble_connected = true;
         // control the blink rate of the blink task
-        xQueueSend(delay_queue, &(uint32_t){1000}, portMAX_DELAY);
-        // Send a custom message as a notification
-        send_ble_notification_or_indication(&ble_connection, "Hello from ESP32!", false); // false = notification
-        esp_ble_gap_stop_advertising();                                                   // Stop advertising after connection
+        xQueueSend(delay_queue, &SLOW_BLINK, portMAX_DELAY);
+        esp_ble_gap_stop_advertising();
+        esp_ble_gap_read_rssi(ble_connection.remote_bda); // send all current data in the rssi calllback
+        // send_ble_notification_or_indication(&ble_connection, "Hello from ESP32!", false); // false = notification
+        //   Stop advertising after connection
 
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
         ble_connected = false;
+        set_pmode_off();
         // control the blink rate of the blink task
-        xQueueSend(delay_queue, &(uint32_t){100}, portMAX_DELAY);
+        xQueueSend(delay_queue, &FAST_BLINK, portMAX_DELAY);
+
         ESP_LOGI(BLE_TAG, "Device disconnected, restarting advertising...");
         vTaskResume(blink_task_handle);             // Pauses the task
         esp_ble_gap_start_advertising(&adv_params); // Restart advertising
@@ -273,26 +327,48 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         break;
 
     case ESP_GATTS_WRITE_EVT:
-        ESP_LOGI(BLE_TAG, "Write request received: %.*s", param->write.len, param->write.value);
-        // if (param->write.handle == ble_connection.cccd_handle && param->write.len == 2)
-        // {
-        //     ESP_LOGI(BLE_TAG, "Client wrote to CCCD: 0x%02x%02x", param->write.value[1], param->write.value[0]);
-        // }
 
-        // Check if the received command is "LED_OFF" or "LED_ON" (case-sensitive)
-        if (param->write.len >= 6 && blink_task_handle != NULL)
+        char cmd_buf[32] = {0};
+        int copy_len = param->write.len < sizeof(cmd_buf) - 1 ? param->write.len : sizeof(cmd_buf) - 1;
+        memcpy(cmd_buf, param->write.value, copy_len);
+        cmd_buf[copy_len] = '\0'; // Null-terminate
+
+        ESP_LOGI(BLE_TAG, "Write request received: %s", cmd_buf);
+
+        // Check exact string matches
+        if (strcmp(cmd_buf, "Hello ESP32!") == 0)
         {
-            if (memcmp(param->write.value, "LED_OFF", 7) == 0)
-            {
-                vTaskSuspend(blink_task_handle); // Pauses the task
-                gpio_set_level(LED_GPIO, 1);     // Ensure LED is off
-                ESP_LOGI(BLE_TAG, "Blink task SUSPENDED");
-            }
-            else if (memcmp(param->write.value, "LED_ON", 6) == 0)
-            {
-                vTaskResume(blink_task_handle); // Pauses the task
-                ESP_LOGI(BLE_TAG, "Blink task RESUMED");
-            }
+            sendChargingStatus();
+        }
+        else if (strcmp(cmd_buf, "P_MODE_ON") == 0)
+        {
+            set_pmode_on();
+        }
+        else if (strcmp(cmd_buf, "P_MODE_OFF") == 0)
+        {
+            set_pmode_off();
+        }
+        else if (strcmp(cmd_buf, "LED_OFF") == 0 && blink_task_handle != NULL)
+        {
+            vTaskSuspend(blink_task_handle);
+            gpio_set_level(LED_GPIO, 1);
+            ESP_LOGI(BLE_TAG, "Blink task SUSPENDED");
+        }
+        else if (strcmp(cmd_buf, "LED_ON") == 0 && blink_task_handle != NULL)
+        {
+            vTaskResume(blink_task_handle);
+            ESP_LOGI(BLE_TAG, "Blink task RESUMED");
+        }
+        else if (strncmp(cmd_buf, "LEVEL", 5) == 0)
+        {
+            int level = atoi(&cmd_buf[5]); // Extract number after "LEVEL"
+            ESP_LOGI(BLE_TAG, "Received LEVEL command: %d", level);
+            usr_tr_lvl = level;
+            ldr_trigger_lvl = usr_tr_lvl;
+        }
+        else
+        {
+            ESP_LOGW(BLE_TAG, "Unknown command: %s", cmd_buf);
         }
 
         // Validate handle before sending response
@@ -347,7 +423,7 @@ void gpio_event_task(void *arg)
             ESP_LOGI("GPIO", "Detected change on GPIO %d, new state: %d", gpio_num, level);
             if (ble_connected)
             {
-                snprintf(info_str, sizeof(info_str), "Status: %s", level ? "Not Charging" : "Charging");
+                snprintf(info_str, sizeof(info_str), level ? "Not Charging" : "Charging");
                 send_ble_notification_or_indication(&ble_connection, info_str, false);
             }
         }
@@ -364,7 +440,7 @@ void init_pins(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_POSEDGE};
+        .intr_type = GPIO_INTR_ANYEDGE};
     // I'm just doing this to appreciate the syntax
     gpio_config_t *gpio_config_ptr = &io_conf;
     gpio_config(gpio_config_ptr);
@@ -389,14 +465,16 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     case ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT:
         if (param->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS)
         {
-            //snprintf(notifMessage, sizeof(notifMessage), "V%.2fR%d", vBattery, param->read_rssi_cmpl.rssi);
+            // snprintf(notifMessage, sizeof(notifMessage), "V%.2fR%d", vBattery, param->read_rssi_cmpl.rssi);
+            int level = gpio_get_level(STAT_PIN);
             snprintf(
                 notifMessage,
                 sizeof(notifMessage),
-                "V%.2fL%.0fR%d",
+                "V%.2fL%.0fR%dB%d",
                 vBattery,
                 vLightSense * 100.0f,
-                param->read_rssi_cmpl.rssi); //e.g. "V3.76L81R-64"
+                param->read_rssi_cmpl.rssi,
+                level); // e.g. "V3.76L81R-64B1"
 
             send_ble_notification_or_indication(&ble_connection, notifMessage, false);
         }
@@ -449,7 +527,7 @@ void ble_rssi_notify_task(void *pvParameter)
 {
     for (;;)
     {
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(rssi_read_intvl)); // 10 seconds default
 
         if (ble_connected)
         {
@@ -504,13 +582,29 @@ void read_ldr_light_task(void *pvParameters)
         // Optionally normalize it to 0.0–1.0
         vLightSense = avg / 4095.0f;
 
-        ESP_LOGI("LDR", "Raw: %.2f | Brightness: %.2f%%", avg, vLightSense * 100);
+        int vLightPercent = (int)(vLightSense * 100 + 0.5f);
+        if (ldr_read_intvl > 1500) // because dont want too much logging
+        {
+            ESP_LOGI("LDR", "Raw: %.2f | Brightness: %d%%", avg, vLightPercent);
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Update every 2s
+        if (vLightPercent < ldr_trigger_lvl)
+        {
+            // possibly logging every 500ms
+            ESP_LOGI("LDR", "LDR Event threshold trigger: %d", ldr_trigger_lvl);
+            if (ble_connected && p_mode)
+            {
+                char info_str[20];
+                snprintf(info_str, sizeof(info_str), "LDR!");
+                send_ble_notification_or_indication(&ble_connection, info_str, false);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ldr_read_intvl)); // Update every n seconds
     }
 }
 
-void blink_task(void *pvParameter)
+void blink_task_old(void *pvParameter)
 {
     uint32_t count = 0, current_delay = *(uint32_t *)pvParameter;
 
@@ -523,6 +617,27 @@ void blink_task(void *pvParameter)
             ESP_LOGI(TAG, "Updated delay: %ld ms\n", current_delay);
         }
         vTaskDelay(pdMS_TO_TICKS(current_delay));
+    }
+}
+void blink_task(void *pvParameter)
+{
+    blink_pattern_t pattern = *(blink_pattern_t *)pvParameter;
+
+    for (;;)
+    {
+        gpio_set_level(LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(pattern.on_time));
+
+        gpio_set_level(LED_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(pattern.off_time));
+
+        // Check if a new pattern is available (non-blocking)
+        blink_pattern_t new_pattern;
+        if (xQueueReceive(delay_queue, &new_pattern, 0))
+        {
+            pattern = new_pattern;
+            ESP_LOGI(TAG, "Updated pattern: on=%lu ms, off=%lu ms", pattern.on_time, pattern.off_time);
+        }
     }
 }
 
@@ -605,18 +720,17 @@ void app_main(void)
 
     init_pins();
     init_adc_channels();
-    delay_queue = xQueueCreate(1, sizeof(uint32_t));
+    delay_queue = xQueueCreate(1, sizeof(blink_pattern_t));
 
     ble_init();
 
     ESP_LOGI(TAG, "Limited Information:\n");
     ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
     get_mac_address();
-    xTaskCreate(blink_task, "Blink Task", 2048, (void *)&(uint32_t){1000}, 1, &blink_task_handle);
-    xTaskCreate(ble_rssi_notify_task, "RSSI Notify Task", 2048, NULL, 5, NULL);
-    // xTaskCreate(read_battery_voltage_task, "Battery Voltage  Task", 2048, NULL, 5, NULL);
-    xTaskCreatePinnedToCore(read_battery_voltage_task, "Battery Voltage Task", 4096, NULL, 5, NULL, 0);
 
+    xTaskCreate(blink_task, "Blink Task", 2048, (void *)&FAST_BLINK, 1, &blink_task_handle);
+    xTaskCreate(ble_rssi_notify_task, "RSSI Notify Task", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(read_battery_voltage_task, "Battery Voltage Task", 4096, NULL, 5, NULL, 0);
     xTaskCreate(gpio_event_task, "GPIO Event Task", 2048, NULL, 5, NULL);
     xTaskCreate(read_ldr_light_task, "LDR ADC Read Task", 2048, NULL, 5, NULL);
 
@@ -628,7 +742,8 @@ void app_main(void)
     // vTaskDelete(NULL); // deletes the main task safely
     ESP_LOGI(TAG, "Waiting for BLE connections........\n");
     // control the blink rate of the blink task
-    xQueueSend(delay_queue, &(uint32_t){100}, portMAX_DELAY);
+    // xQueueSend(delay_queue, &FAST_BLINK, portMAX_DELAY);
+
     while (true)
     {
         vTaskDelay(portMAX_DELAY); // main task sleeps forever
