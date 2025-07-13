@@ -41,6 +41,8 @@ static const char *TAG = "ESP32C3";
 #define INVALID_LDR_LEVEL -1
 #define RSSI_READ_INTVL 5000
 #define DEFAULT_LDR_READ_INTVL 2000
+#define HIGH_SPEED_LDR_READ_INTVL 10
+// #define DEBUG
 
 TaskHandle_t blink_task_handle = NULL; // Global variable
 static adc_oneshot_unit_handle_t adc_handle;
@@ -213,7 +215,7 @@ static void set_pmode_on()
 {
     ESP_LOGI("LDR", "Pizza mode on");
     ble.mode.p_mode = true;
-    ble.sensor.ldr_read_interval = 500;
+    ble.sensor.ldr_read_interval = HIGH_SPEED_LDR_READ_INTVL;
 
     int vLightPercent = (int)(ble.sensor.vLightSense * 100 + 0.5f);
     if (ble.mode.auto_threshold_mode)
@@ -237,7 +239,7 @@ static void set_pmode_on()
 static void set_pmode_off()
 {
     ESP_LOGI(TAG, "Pizza mode off");
-    ble.sensor.ldr_read_interval = 2000;
+    ble.sensor.ldr_read_interval = DEFAULT_LDR_READ_INTVL;
     ble.sensor.ldr_trigger_level = 0;
     ble.mode.p_mode = false;
     if (ble.conn.ble_connected)
@@ -570,9 +572,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 param->read_rssi_cmpl.rssi,
                 level); // e.g. "V3.76L81R-64B1"  B1 = not charging B0 = charging
 
-            // snprintf(..., "V%.2fL%.0fR%dB%dT%lu", ..., get_timestamp());  AI suggestions
-            // snprintf(..., "{\"V\":%.2f,\"L\":%.0f,\"R\":%d,\"B\":%d}", ...);
-
             send_ble_notification_or_indication(&ble.conn.connection, ble.conn.notifMessage, false);
         }
         break;
@@ -664,9 +663,17 @@ void read_battery_voltage_task()
 }
 void read_ldr_light_task(void *pvParameters)
 {
+// measure this loop duration
+#ifdef DEBUG
+    int64_t duration_accum = 0;
+    int log_count = 0;
+#endif
 
     for (;;)
     {
+#ifdef DEBUG
+        int64_t start_time = esp_timer_get_time();
+#endif
         int sum = 0;
         for (int i = 0; i < 8; i++)
         {
@@ -674,31 +681,52 @@ void read_ldr_light_task(void *pvParameters)
             adc_oneshot_read(adc_handle, ADC_CHANNEL_2, &r);
             sum += r;
         }
-        float avg = sum / 8.0;
 
+        float avg = sum / 8.0;
         // Optionally normalize it to 0.0–1.0
         ble.sensor.vLightSense = avg / 4095.0f;
-
         int vLightPercent = (int)(ble.sensor.vLightSense * 100 + 0.5f);
 
-        if (ble.sensor.ldr_read_interval > 1500) // because dont want too much logging
+#ifdef DEBUG
+        if (ble.sensor.ldr_read_interval > 1000) // because dont want too much logging
         {
+            // will crash if task loop is too short
             ESP_LOGI("LDR", "Raw: %.2f | Brightness: %d%%", avg, vLightPercent);
+            // ESP_LOGI("LDR", "LDR Event threshold trigger: %d", ble.sensor.ldr_trigger_level);
         }
+#endif
 
         if (vLightPercent < ble.sensor.ldr_trigger_level)
         {
+
+#ifdef DEBUG
             // logging every 500ms if in pizza mode
             ESP_LOGI("LDR", "LDR Event threshold trigger: %d", ble.sensor.ldr_trigger_level);
+#endif
             if (ble.conn.ble_connected && ble.mode.p_mode)
             {
+                // ble.mode.p_mode = false;  //(42206) BLE: Debounced: Skipping repeated notification
                 char info_str[20];
                 snprintf(info_str, sizeof(info_str), "LDR!");
                 send_ble_notification_or_indication(&ble.conn.connection, info_str, false);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(ble.sensor.ldr_read_interval)); // Update every n seconds (default 2 seconds) changes to 500ms in Pizza Mode
+#ifdef DEBUG
+        int64_t end_time = esp_timer_get_time();
+        int64_t elapsed_us = end_time - start_time;
+        duration_accum += elapsed_us;
+        log_count++;
+
+        if (log_count >= 50)
+        {
+            int64_t avg_us = duration_accum / log_count;
+            ESP_LOGI("LDR", "Avg loop time over %d runs: %" PRId64 " us", log_count, avg_us);
+            duration_accum = 0;
+            log_count = 0;
+        }
+#endif
+        vTaskDelay(pdMS_TO_TICKS(ble.sensor.ldr_read_interval)); // Update every n seconds (default 2 seconds) changes to 20ms in Pizza Mode
     }
 }
 
@@ -815,7 +843,7 @@ void app_main(void)
     xTaskCreate(ble_rssi_notify_task, "RSSI Notify Task", 2048, NULL, 5, NULL);
     xTaskCreatePinnedToCore(read_battery_voltage_task, "Battery Voltage Task", 4096, NULL, 5, NULL, 0);
     xTaskCreate(gpio_event_task, "GPIO Event Task", 2048, NULL, 5, NULL);
-    xTaskCreate(read_ldr_light_task, "LDR ADC Read Task", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(read_ldr_light_task, "LDR ADC Read Task", 2048, NULL, 6, NULL, 0);
 
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, 20); // -12 dBm
     esp_power_level_t power = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV);
