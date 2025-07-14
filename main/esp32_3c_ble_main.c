@@ -355,9 +355,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
     case ESP_GATTS_DISCONNECT_EVT:
         ble.conn.ble_connected = false;
-        set_pmode_off();
-        // control the blink rate of the blink task
-        xQueueSend(led_delay_queue, &FAST_BLINK, portMAX_DELAY);
+        set_pmode_off();  //also restores blink rate for disconnected state
 
         ESP_LOGI(BLE_TAG, "Device disconnected, restarting advertising...");
         vTaskResume(blink_task_handle);             // Pauses the task
