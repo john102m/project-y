@@ -230,10 +230,10 @@ static void set_pmode_on()
         // Use ble.sensor.user_trigger_level if it's valid, otherwise use default
         ble.sensor.ldr_trigger_level = (ble.sensor.user_trigger_level < 0) ? DEFAULT_LDR_TRIGGER_LEVEL : ble.sensor.user_trigger_level;
     }
-
+#ifdef DEBUG
     ESP_LOGI(TAG, "Current light level: %d%%", vLightPercent);
     ESP_LOGI(TAG, "LDR Event threshold trigger level: %d%%", ble.sensor.ldr_trigger_level);
-
+#endif
     xQueueSend(led_delay_queue, &PMODE_PATTERN, portMAX_DELAY);
 }
 static void set_pmode_off()
@@ -260,9 +260,10 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
     case ESP_GATTS_REG_EVT:
         // Define the service ID and initialize the UUID field properly
+#ifdef DEBUG       
         ESP_LOGI(BLE_TAG, "GATT Server registered");
         ESP_LOGI(BLE_TAG, "Creating service with UUID: %02x%02x...", SERVICE_UUID[0], SERVICE_UUID[1]);
-
+#endif
         // Define the service ID with proper initialization
         esp_gatt_srvc_id_t service_id = {
             .is_primary = true,
